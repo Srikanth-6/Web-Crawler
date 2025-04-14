@@ -13,10 +13,15 @@ import org.openqa.selenium.WebDriver;
 import org.openqa.selenium.chrome.ChromeDriver;
 import org.openqa.selenium.chrome.ChromeOptions;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 public class ProductUrlCrawlerChecker {
 
+    private static final Logger logger = LoggerFactory.getLogger(ProductUrlCrawlerChecker.class);
+
     private static final int MAX_THREADS = 5;
-    private static final int MAX_PRODUCT_URLS_PER_DOMAIN = 5;
+    private static final int MAX_PRODUCT_URLS_PER_DOMAIN = 20;
 
     private static final List<String> START_DOMAINS = List.of(
             "https://www.flipkart.com/",
@@ -26,11 +31,6 @@ public class ProductUrlCrawlerChecker {
     );
 
     private static final Pattern PRODUCT_URL_PATTERN = Pattern.compile(".*(product|women|men|item).*", Pattern.CASE_INSENSITIVE);
-    private static final List<String> USER_AGENTS = List.of(
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36"
-    );
 
     private static final ExecutorService executor = Executors.newFixedThreadPool(MAX_THREADS);
     private static final Map<String, Set<String>> productUrlsByDomain = new ConcurrentHashMap<>();
@@ -40,57 +40,66 @@ public class ProductUrlCrawlerChecker {
         Set<String> visitedUrls = ConcurrentHashMap.newKeySet();
         List<Future<Set<String>>> futures = new ArrayList<>();
 
+        logger.info("Starting the crawler with {} domains...", START_DOMAINS.size());
 
         while (true) {
 
-            if(urlQueue.isEmpty()){
+            if (urlQueue.isEmpty()) {
                 long pending = futures.stream().filter(f -> !f.isDone()).count();
-                if(pending>0) {
-                    System.out.println("There are still "+pending+" pending tasks bro");
+                if (pending > 0) {
+                    logger.info("Waiting for {} tasks to complete...", pending);
                     getFutures(futures, urlQueue);
-                }
-                else {
+                } else {
+                    logger.info("No more URLs to crawl. Shutting down executor.");
                     executor.shutdownNow();
                     break;
                 }
             }
 
             String url = urlQueue.poll();
-            if (url==null || visitedUrls.contains(url)) continue;
+            if (url == null || visitedUrls.contains(url)) continue;
+            visitedUrls.add(url);
 
             String baseDomain = extractBaseDomain(url);
             if (baseDomain == null) continue;
-            // domain size check.
-            Set<String> productUrls = productUrlsByDomain.computeIfAbsent(baseDomain, k -> ConcurrentHashMap.newKeySet());
-            System.out.println("Before basDom " + baseDomain + " size = "+productUrls.size());
-            if(productUrls.size() >= MAX_PRODUCT_URLS_PER_DOMAIN) continue;
-            System.out.println("After basDom " + baseDomain + " url = "+url);
-            Future<Set<String>> future = executor.submit(() -> crawlPage(baseDomain, url));
 
+            Set<String> productUrls = productUrlsByDomain.computeIfAbsent(baseDomain, k -> ConcurrentHashMap.newKeySet());
+            if (productUrls.size() >= MAX_PRODUCT_URLS_PER_DOMAIN) continue;
+
+            logger.info("Submitting crawl task for URL: {}", url);
+            Future<Set<String>> future = executor.submit(() -> crawlPage(baseDomain, url));
             futures.add(future);
         }
 
         productUrlsByDomain.forEach((domain, urls) ->
-            System.out.println("Domain: " + domain + " | URLs: " + urls.size())
+                logger.info("Collected {} product URLs for domain: {}", urls.size(), domain)
         );
-        executor.shutdown();
+
         saveProductUrlsToFile();
+        executor.shutdown();
+        logger.info("Crawling complete. Results written to product_urls.json");
     }
 
     private static void getFutures(List<Future<Set<String>>> futures, Queue<String> urlQueue) throws ExecutionException, InterruptedException {
         for (Future<Set<String>> future : futures) {
             Set<String> discoveredUrls = future.get();
 
-            for(String url : discoveredUrls) {
+            for (String url : discoveredUrls) {
                 if (PRODUCT_URL_PATTERN.matcher(url).matches()) {
                     String baseDomain = extractBaseDomain(url);
-                    System.out.println("baseDom = "+baseDomain + " url = "+ url);
-                    Set<String> productUrls = productUrlsByDomain.computeIfAbsent(baseDomain, k ->  ConcurrentHashMap.newKeySet());
-                    if(!productUrls.contains(url)) {
+                    if (baseDomain == null) continue;
+
+                    Set<String> productUrls = productUrlsByDomain.computeIfAbsent(baseDomain, k -> ConcurrentHashMap.newKeySet());
+
+                    if (!productUrls.contains(url)) {
                         urlQueue.add(url);
+                        logger.debug("Adding new potential product URL: {}", url);
                     }
-                    if(productUrls.size() >= MAX_PRODUCT_URLS_PER_DOMAIN) continue;
-                    productUrls.add(url);
+
+                    if (productUrls.size() < MAX_PRODUCT_URLS_PER_DOMAIN) {
+                        productUrls.add(url);
+                        logger.info("Product URL added under domain {}: {}", baseDomain, url);
+                    }
                 }
             }
         }
@@ -98,10 +107,8 @@ public class ProductUrlCrawlerChecker {
     }
 
     private static String extractBaseDomain(String url) {
-        System.out.println("Check url = " + url);
         String[] parts = url.split("\\.");
         if (parts.length >= 2) {
-            // To correctly extract base domain, return the second-to-last part and the last part
             String domain = parts[1];
             return "https://www." + domain + ".com";
         }
@@ -112,10 +119,10 @@ public class ProductUrlCrawlerChecker {
         Set<String> discoveredUrls = new HashSet<>();
 
         try {
+            logger.debug("Crawling page: {}", currentUrl);
             String pageHtml = fetchHtmlContent(currentUrl);
             Document document = Jsoup.parse(pageHtml, currentUrl);
 
-            // Combine <a> and <link> elements with hrefs
             Elements links = new Elements();
             links.addAll(document.select("a[href]"));
             links.addAll(document.select("link[href]"));
@@ -125,8 +132,10 @@ public class ProductUrlCrawlerChecker {
                 if (isInvalidUrl(href, baseDomain)) continue;
                 discoveredUrls.add(href);
             }
+
+            logger.debug("Discovered {} URLs on page: {}", discoveredUrls.size(), currentUrl);
         } catch (Exception e) {
-            System.err.println("Failed to crawl: " + currentUrl + " | Error: " + e.getMessage());
+            logger.error("Failed to crawl: {} | Error: {}", currentUrl, e.getMessage());
         }
 
         return discoveredUrls;
@@ -134,25 +143,24 @@ public class ProductUrlCrawlerChecker {
 
     private static boolean isInvalidUrl(String url, String domain) {
         return url.isEmpty() ||
-               url.contains("#") ||
-               url.endsWith(".jpg") ||
-               url.endsWith(".png") ||
-               !url.startsWith(domain);
+                url.contains("#") ||
+                url.endsWith(".jpg") ||
+                url.endsWith(".png") ||
+                !url.startsWith(domain);
     }
 
     private static String fetchHtmlContent(String url) {
         WebDriverManager.chromedriver().setup();
 
         ChromeOptions options = new ChromeOptions();
-        options.addArguments("--headless"); // run in headless mode
+        options.addArguments("--headless");
         options.addArguments("--no-sandbox");
-        options.addArguments("--disable-dev-shm-usage"); // useful in containers
-        options.addArguments("--disable-gpu"); // o
+        options.addArguments("--disable-dev-shm-usage");
+        options.addArguments("--disable-gpu");
 
         WebDriver driver = new ChromeDriver(options);
         driver.get(url);
         String pageSource = driver.getPageSource();
-        System.out.println("Still crawling bro");
         driver.quit();
         return pageSource;
     }
@@ -171,7 +179,7 @@ public class ProductUrlCrawlerChecker {
             }
             writer.write("}\n");
         } catch (IOException e) {
-            System.err.println("Error writing results: " + e.getMessage());
+            logger.error("Error writing product URLs to file: {}", e.getMessage());
         }
     }
 }
